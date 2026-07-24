@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Gmail Sanitizer",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": ["--archive-email", "editor@members.wayfair.com"],
+      "xargs": ["--email", "support@ashanderie.com"],
+      "xargs": ["--email", "chicagotribune@nws.chicagotribune.com"],
+      "xargs": ["--frequency","--max-results","499"],
+      "xargs": ["--all-email","hello@theloadedteashop.com"]
+      
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    }
+  ]
+}
