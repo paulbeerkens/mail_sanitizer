@@ -47,6 +47,14 @@ def print_email_filtered_results(headlines, email_address):
         print(f"{date} — {subject} — {folder} — {label_text}")
 
 
+def confirm_archive_prompt():
+    try:
+        confirmation = input("Archive these messages? [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return confirmation in {"y", "yes"}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gmail sanitizer")
     parser.add_argument("--frequency", action="store_true", help="Count sender email frequencies for unread messages")
@@ -84,8 +92,7 @@ def main():
 
         print_email_filtered_results(headlines, args.archive_email_address)
 
-        confirmation = input("Archive these messages? [y/N]: ").strip().lower()
-        if confirmation not in {"y", "yes"}:
+        if not confirm_archive_prompt():
             print("Archive cancelled.")
             return
 
