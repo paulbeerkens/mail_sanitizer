@@ -77,19 +77,13 @@ def list_unread_headlines_by_sender(service, sender_email: Optional[str], max_re
     return out
 
 
-def archive_messages_by_sender(service, sender_email: Optional[str], max_results: int = 50) -> int:
-    """Archive unread messages from a sender email address and return the number archived."""
-    max_results = max(1, max_results)
-    query = _build_query(sender_email)
-
-    results = service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
-    messages = results.get("messages", [])[:max_results]
-
+def archive_messages(service, message_ids: List[str]) -> int:
+    """Remove messages from the inbox, add them to trash, and return the number changed."""
     archived_count = 0
-    for m in messages:
+    for message_id in message_ids:
         service.users().messages().modify(
             userId="me",
-            id=m["id"],
+            id=message_id,
             body={"removeLabelIds": ["INBOX"], "addLabelIds": ["TRASH"]},
         ).execute()
         archived_count += 1

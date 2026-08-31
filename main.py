@@ -97,14 +97,7 @@ def main():
             return
 
         message_ids = [headline.get("id") for headline in headlines if headline.get("id")]
-        archived_count = 0
-        for message_id in message_ids:
-            service.users().messages().modify(
-                userId="me",
-                id=message_id,
-                body={"removeLabelIds": ["INBOX"], "addLabelIds": ["TRASH"]},
-            ).execute()
-            archived_count += 1
+        archived_count = client.archive_messages(service, message_ids)
 
         print(f"Archived {archived_count} unread message(s) from {args.archive_email_address}.")
         return
