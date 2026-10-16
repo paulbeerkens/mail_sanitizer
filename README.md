@@ -77,6 +77,27 @@ message except Promotions, use:
 Database dumps search the Inbox by default. Add `--include-archived` to include
 messages outside the Inbox.
 
+To store read and unread messages from one sender across all categories and
+locations except Spam and Trash, use:
+
+```bash
+.venv/bin/python main.py --database-dump \
+  --sender-email sender@example.com --max-results 10000
+```
+
+`--sender-email` automatically uses all categories and includes archived mail,
+so the Gmail query is `from:sender@example.com`. Gmail's normal search behavior
+excludes Spam and Trash. The retrieved metadata is written to SQLite after each
+completed page.
+
+The sender-specific dump can be extended backward using a history boundary
+calculated only from that sender's stored messages:
+
+```bash
+.venv/bin/python main.py --database-dump \
+  --sender-email sender@example.com --expand-history --max-results 10000
+```
+
 Gmail uses `primary` in search queries but returns `CATEGORY_PERSONAL` in the
 API message `labelIds`; the application maps between those names when querying
 the local database.
@@ -128,10 +149,50 @@ To include both read and unread Promotions messages from the sender, use:
 the SQLite database for their initial message selection and use the same
 preview, confirmation, Trash throttling, progress, and per-message database
 commits. `--archive-email` selects only unread, untrashed records;
-`--archive-all-promotional-email` selects both read and unread untrashed records. After
-`--archive-all-promotional-email` finishes, the app runs the equivalent of `--all-email`
-without `--in-anywhere` and displays any messages from that sender that remain
-outside Spam and Trash.
+`--archive-all-promotional-email` selects and previews every read and unread
+untrashed Promotions record. The actual Trash operation is limited to the
+newest `--max-results` messages. After it finishes, the app runs the equivalent
+of `--all-email` without `--in-anywhere` and displays any messages from that
+sender that remain outside Spam and Trash.
+
+To trash every locally stored Inbox message from a sender across all Gmail
+categories, use:
+
+```bash
+.venv/bin/python main.py --archive-all-inbox-email sender@example.com
+```
+
+This command loads every matching untrashed Inbox record from SQLite without a
+preview limit and prints all headlines before making changes. The actual Trash
+operation is limited to the newest `--max-results` messages. It then requires
+an explicit yes/no confirmation. Only messages carrying the `INBOX` label are
+selected; archived, Spam, and Trash messages are excluded.
+
+After the Trash operations finish, the command queries Gmail with
+`from:sender@example.com in:inbox` and displays up to `--max-results` messages
+from that sender that still remain in the Inbox.
+
+To process the top unread Inbox senders while excluding every address in the
+`archive_list` table, use:
+
+```bash
+.venv/bin/python main.py --archive-top-inbox-senders 3 \
+  --refresh-max-results 100000 --max-results 3500 --page-delay 5
+```
+
+The ranking excludes Promotions and Social messages, trashed rows, and sender
+addresses found in `archive_list` (case-insensitively). The candidate list is
+captured and displayed clearly before processing starts. A ten-second
+countdown lets the user type `q` and press Enter to cancel the entire run before
+Gmail is contacted. For each candidate, the app refreshes that sender from
+Gmail, previews every current Inbox headline, requests a separate confirmation,
+trashes at most `--max-results` newest messages, and checks Gmail for what
+remains in the Inbox. Cancelling one sender continues with the next.
+
+All archive commands protect messages whose headlines contain `purchase`,
+`purchased`, or `invoice`, using case-insensitive substring matching. Protected
+messages are omitted from archive previews and Trash operations. The top-sender
+ranking also excludes them from its counts.
 
 For previews and sender queries, Gmail supplies the current matching message
 IDs and metadata is loaded from SQLite when available. The app calls Gmail

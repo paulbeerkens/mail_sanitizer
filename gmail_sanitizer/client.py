@@ -296,6 +296,7 @@ def list_messages_by_sender(
         Callable[[List[str]], Dict[str, Dict[str, Any]]]
     ] = None,
     in_anywhere: bool = False,
+    inbox_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return messages by sender without requiring them to be unread."""
     query = _build_query(
@@ -303,6 +304,7 @@ def list_messages_by_sender(
         unread_only=False,
         promotions_only=False,
         in_anywhere=in_anywhere,
+        inbox_only=inbox_only,
     )
     metadata_cache = {}
     messages = _list_message_references(
@@ -329,12 +331,13 @@ def list_messages_for_database_dump(
     category: str = "promotions",
     unread_only: bool = False,
     include_archived: bool = False,
+    sender_email: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return messages matching the requested database-dump scope."""
     if category not in DATABASE_DUMP_CATEGORIES:
         raise ValueError(f"Unsupported Gmail category: {category}")
     query = _build_query(
-        None,
+        sender_email,
         unread_only=unread_only,
         promotions_only=False,
         before_epoch_seconds=before_epoch_seconds,

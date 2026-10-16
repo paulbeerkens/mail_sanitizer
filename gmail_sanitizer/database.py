@@ -16,6 +16,11 @@ CATEGORY_LABEL_IDS = {
     "social": "CATEGORY_SOCIAL",
     "forums": "CATEGORY_FORUMS",
 }
+ARCHIVE_EXCLUDED_HEADLINE_KEYWORDS = (
+    "purchase",
+    "purchased",
+    "invoice",
+)
 _INITIALIZED_DATABASES = set()
 _INITIALIZATION_LOCK = Lock()
 QUERY_LOGGER = logging.getLogger("gmail_sanitizer.query")
@@ -33,6 +38,13 @@ def _execute(connection, sql: str, parameters=()):
             tuple(parameters),
         )
     return connection.execute(sql, parameters)
+
+
+def _append_archive_headline_exclusions(query, parameters, column):
+    for keyword in ARCHIVE_EXCLUDED_HEADLINE_KEYWORDS:
+        query += f" AND LOWER(COALESCE({column}, '')) NOT LIKE ?"
+        parameters.append(f"%{keyword.lower()}%")
+    return query
 
 
 def _initialize_schema(connection: sqlite3.Connection) -> None:
@@ -69,6 +81,14 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             "ALTER TABLE messages ADD COLUMN trashed INTEGER NOT NULL DEFAULT 0 "
             "CHECK (trashed IN (0, 1))"
         )
+    _execute(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS archive_list (
+            sender_email TEXT NOT NULL
+        )
+        """,
+    )
 
 
 def _connect(database_path: Path) -> sqlite3.Connection:
@@ -96,6 +116,7 @@ def get_oldest_internal_date_ms(
     category: str = "all",
     unread_only: bool = False,
     include_archived: bool = True,
+    sender_email: Optional[str] = None,
 ) -> Optional[int]:
     """Return the oldest stored Gmail date matching a database-dump scope."""
     query = """
@@ -104,6 +125,9 @@ def get_oldest_internal_date_ms(
         WHERE account_email = ? AND internal_date_ms IS NOT NULL
     """
     parameters = [account_email]
+    if sender_email:
+        query += " AND sender_email = ? COLLATE NOCASE"
+        parameters.append(sender_email.strip())
     if unread_only:
         query += " AND is_unread = 1"
     if not include_archived:
@@ -175,6 +199,64 @@ def count_unread_promotions_by_sender(
     return [(sender_email, count) for sender_email, count in rows]
 
 
+def list_top_unread_inbox_senders(
+    account_email: str,
+    limit: int,
+    database_path: Path = DEFAULT_DATABASE_PATH,
+) -> list[Dict[str, Any]]:
+    """Rank unread non-Promotions/non-Social Inbox senders not protected."""
+    with _connect(Path(database_path)) as connection:
+        query = """
+            SELECT m.sender_email,
+                   COUNT(*) AS message_count,
+                   MIN(m.internal_date_ms) AS oldest_internal_date_ms,
+                   MAX(m.internal_date_ms) AS newest_internal_date_ms
+            FROM messages AS m
+            WHERE m.account_email = ?
+              AND m.trashed = 0
+              AND m.is_unread = 1
+              AND m.sender_email IS NOT NULL
+              AND m.sender_email != ''
+              AND EXISTS (
+                  SELECT 1 FROM json_each(m.label_ids)
+                  WHERE json_each.value = 'INBOX'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM json_each(m.label_ids)
+                  WHERE json_each.value IN (
+                      'CATEGORY_PROMOTIONS',
+                      'CATEGORY_SOCIAL'
+                  )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM archive_list AS protected
+                  WHERE protected.sender_email = m.sender_email COLLATE NOCASE
+              )
+        """
+        parameters = [account_email]
+        query = _append_archive_headline_exclusions(
+            query,
+            parameters,
+            "m.headline",
+        )
+        query += """
+            GROUP BY m.sender_email COLLATE NOCASE
+            ORDER BY message_count DESC, m.sender_email COLLATE NOCASE
+            LIMIT ?
+        """
+        parameters.append(max(1, limit))
+        rows = _execute(connection, query, parameters).fetchall()
+    return [
+        {
+            "sender_email": sender_email,
+            "message_count": message_count,
+            "oldest_internal_date_ms": oldest,
+            "newest_internal_date_ms": newest,
+        }
+        for sender_email, message_count, oldest, newest in rows
+    ]
+
+
 def get_cached_message_metadata(
     account_email: str,
     message_ids: Iterable[str],
@@ -221,11 +303,10 @@ def list_promotions_by_sender(
     account_email: str,
     sender_email: str,
     unread_only: bool,
-    max_results: int,
+    max_results: Optional[int],
     database_path: Path = DEFAULT_DATABASE_PATH,
 ) -> list[Dict[str, Any]]:
     """Return untrashed Promotions messages for a sender from SQLite."""
-    max_results = max(1, max_results)
     query = """
         SELECT message_id, sender_email, headline, message_date,
                internal_date_ms, label_ids, folder, is_unread
@@ -241,9 +322,68 @@ def list_promotions_by_sender(
     parameters = [account_email, sender_email.strip()]
     if unread_only:
         query += " AND is_unread = 1"
-    query += " ORDER BY internal_date_ms DESC LIMIT ?"
-    parameters.append(max_results)
+    query = _append_archive_headline_exclusions(
+        query,
+        parameters,
+        "messages.headline",
+    )
+    query += " ORDER BY internal_date_ms DESC"
+    if max_results is not None:
+        query += " LIMIT ?"
+        parameters.append(max(1, max_results))
 
+    with _connect(Path(database_path)) as connection:
+        rows = _execute(connection, query, parameters).fetchall()
+
+    return [
+        {
+            "id": message_id,
+            "from": sender,
+            "subject": headline,
+            "date": message_date,
+            "internalDate": internal_date,
+            "labelIds": json.loads(labels),
+            "folder": folder,
+            "isUnread": bool(is_unread),
+        }
+        for (
+            message_id,
+            sender,
+            headline,
+            message_date,
+            internal_date,
+            labels,
+            folder,
+            is_unread,
+        ) in rows
+    ]
+
+
+def list_inbox_messages_by_sender(
+    account_email: str,
+    sender_email: str,
+    database_path: Path = DEFAULT_DATABASE_PATH,
+) -> list[Dict[str, Any]]:
+    """Return every stored, untrashed Inbox message for a sender."""
+    query = """
+            SELECT message_id, sender_email, headline, message_date,
+                   internal_date_ms, label_ids, folder, is_unread
+            FROM messages
+            WHERE account_email = ?
+              AND sender_email = ? COLLATE NOCASE
+              AND trashed = 0
+              AND EXISTS (
+                  SELECT 1 FROM json_each(messages.label_ids)
+                  WHERE json_each.value = 'INBOX'
+              )
+    """
+    parameters = [account_email, sender_email.strip()]
+    query = _append_archive_headline_exclusions(
+        query,
+        parameters,
+        "messages.headline",
+    )
+    query += " ORDER BY internal_date_ms DESC"
     with _connect(Path(database_path)) as connection:
         rows = _execute(connection, query, parameters).fetchall()
 

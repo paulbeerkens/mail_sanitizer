@@ -1,6 +1,8 @@
 import argparse
 import logging
+import select
 import sys
+import time
 from collections import Counter
 from datetime import datetime
 from email.utils import parsedate_to_datetime
@@ -47,6 +49,20 @@ def format_date(value):
     return parsed.strftime("%Y%m%d")
 
 
+def format_internal_date_ms(value):
+    if value is None:
+        return "(unknown)"
+    return datetime.fromtimestamp(value / 1000).astimezone().isoformat(
+        timespec="seconds"
+    )
+
+
+def bold_terminal(value):
+    if sys.stdout.isatty():
+        return f"\033[1m{value}\033[0m"
+    return value
+
+
 def print_email_filtered_results(headlines, email_address, unread_only=True):
     message_kind = "Unread messages" if unread_only else "Messages"
     print(f"\n{message_kind} from {email_address} ({len(headlines)} total):")
@@ -67,6 +83,49 @@ def confirm_archive_prompt(message_count):
     except EOFError:
         return False
     return confirmation in {"y", "yes"}
+
+
+def confirm_all_inbox_archive_prompt(
+    email_address,
+    archive_count,
+    total_matching_count,
+):
+    print(
+        "\nWARNING: This will move Inbox messages from "
+        f"{email_address} to Gmail Trash across all categories. "
+        f"The newest {archive_count} of {total_matching_count} listed "
+        "messages will be affected."
+    )
+    try:
+        confirmation = input(
+            f"Are you sure you want to trash {archive_count} of the "
+            f"{total_matching_count} listed messages? "
+            "[y/N]: "
+        ).strip().lower()
+    except EOFError:
+        return False
+    return confirmation in {"y", "yes"}
+
+
+def wait_for_top_sender_start(seconds=10):
+    print(
+        f"\nProcessing begins in {seconds} seconds. "
+        "Type q and press Enter to exit."
+    )
+    for remaining in range(seconds, 0, -1):
+        print(f"\rStarting in {remaining}... ", end="", flush=True)
+        try:
+            readable, _, _ = select.select([sys.stdin], [], [], 1)
+        except (OSError, ValueError):
+            time.sleep(1)
+            continue
+        if readable:
+            response = sys.stdin.readline().strip().lower()
+            if response in {"q", "quit", "exit"}:
+                print()
+                return False
+    print("\rStarting now!          ")
+    return True
 
 
 def main():
@@ -97,6 +156,17 @@ def main():
         "--archive-all-promotional-email",
         dest="archive_all_promotional_email_address",
         help="Trash read and unread Promotions messages selected from SQLite for this sender",
+    )
+    archive_group.add_argument(
+        "--archive-all-inbox-email",
+        dest="archive_all_inbox_email_address",
+        help="Trash every stored Inbox message for this sender across all categories",
+    )
+    archive_group.add_argument(
+        "--archive-top-inbox-senders",
+        type=int,
+        metavar="COUNT",
+        help="Refresh and process the top unread non-Promotions/non-Social Inbox senders",
     )
     commands.add_argument(
         "--database-dump",
@@ -132,6 +202,10 @@ def main():
         help="With --database-dump, include messages outside the Inbox",
     )
     modifiers.add_argument(
+        "--sender-email",
+        help="With --database-dump, retrieve messages from this sender",
+    )
+    modifiers.add_argument(
         "--account-email",
         help="With --count, select the Gmail account stored in SQLite",
     )
@@ -141,7 +215,7 @@ def main():
         "--max-results",
         type=int,
         default=50,
-        help="Maximum total number of messages to retrieve (default: 50)",
+        help="Maximum messages to retrieve or archive (default: 50)",
     )
     request_settings.add_argument(
         "--page-delay",
@@ -156,6 +230,12 @@ def main():
         default=client.DEFAULT_TRASH_DELAY_SECONDS,
         metavar="SECONDS",
         help=f"Delay between individual Trash operations (default: {client.DEFAULT_TRASH_DELAY_SECONDS} seconds)",
+    )
+    request_settings.add_argument(
+        "--refresh-max-results",
+        type=int,
+        default=100000,
+        help="Maximum Gmail messages refreshed per top sender (default: 100000)",
     )
 
     output_options = parser.add_argument_group("output options")
@@ -180,6 +260,15 @@ def main():
         parser.error("--page-delay must be zero or greater")
     if args.trash_delay < 0:
         parser.error("--trash-delay must be zero or greater")
+    if args.max_results < 1:
+        parser.error("--max-results must be at least 1")
+    if args.refresh_max_results < 1:
+        parser.error("--refresh-max-results must be at least 1")
+    if (
+        args.archive_top_inbox_senders is not None
+        and args.archive_top_inbox_senders < 1
+    ):
+        parser.error("--archive-top-inbox-senders must be at least 1")
     if args.expand_history and not args.database_dump:
         parser.error("--expand-history requires --database-dump")
     if args.category != "promotions" and not args.database_dump:
@@ -188,6 +277,8 @@ def main():
         parser.error("--unread-only requires --database-dump")
     if args.include_archived and not args.database_dump:
         parser.error("--include-archived requires --database-dump")
+    if args.sender_email and not args.database_dump:
+        parser.error("--sender-email requires --database-dump")
     if args.in_anywhere and not args.all_email_address:
         parser.error("--in-anywhere requires --all-email")
     if args.account_email and not args.count:
@@ -232,13 +323,21 @@ def main():
         return database.get_cached_message_metadata(account_email, message_ids)
 
     if args.database_dump:
+        dump_category = args.category
+        include_archived = args.include_archived
+        if args.sender_email:
+            if dump_category == "promotions":
+                dump_category = "all"
+            include_archived = True
+
         before_epoch_seconds = None
         if args.expand_history:
             oldest_internal_date_ms = database.get_oldest_internal_date_ms(
                 account_email,
-                category=args.category,
+                category=dump_category,
                 unread_only=args.unread_only,
-                include_archived=args.include_archived,
+                include_archived=include_archived,
+                sender_email=args.sender_email,
             )
             if oldest_internal_date_ms is None:
                 parser.error(
@@ -260,12 +359,18 @@ def main():
             page_delay_seconds=args.page_delay,
             before_epoch_seconds=before_epoch_seconds,
             page_callback=store_page,
-            category=args.category,
+            category=dump_category,
             unread_only=args.unread_only,
-            include_archived=args.include_archived,
+            include_archived=include_archived,
+            sender_email=args.sender_email,
+        )
+        dump_description = (
+            f"messages from {args.sender_email}"
+            if args.sender_email
+            else f"{dump_category} messages"
         )
         print(
-            f"Updated {stored_count} {args.category} message(s) "
+            f"Updated {stored_count} {dump_description} "
             "in the local database."
         )
         return
@@ -290,17 +395,166 @@ def main():
         )
         return
 
+    if args.archive_top_inbox_senders is not None:
+        candidates = database.list_top_unread_inbox_senders(
+            account_email,
+            args.archive_top_inbox_senders,
+        )
+        if not candidates:
+            print("No eligible Inbox senders found outside archive_list.")
+            return
+
+        print(
+            f"\n=== Top {len(candidates)} eligible unread Inbox sender(s) "
+            "scheduled for processing ==="
+        )
+        print(
+            "Protected headline keywords: "
+            + ", ".join(database.ARCHIVE_EXCLUDED_HEADLINE_KEYWORDS)
+        )
+        for index, candidate in enumerate(candidates, start=1):
+            displayed_sender = bold_terminal(candidate["sender_email"])
+            print(
+                f"{index}. {displayed_sender}: "
+                f"{candidate['message_count']} unread message(s); "
+                f"oldest {format_internal_date_ms(candidate['oldest_internal_date_ms'])}; "
+                f"newest {format_internal_date_ms(candidate['newest_internal_date_ms'])}"
+            )
+
+        if not wait_for_top_sender_start(10):
+            print("Top-sender processing cancelled before Gmail was contacted.")
+            return
+
+        for index, candidate in enumerate(candidates, start=1):
+            sender_email = candidate["sender_email"]
+            print(
+                f"\n=== Sender {index} of {len(candidates)}: "
+                f"{sender_email} ==="
+            )
+            refreshed_count = 0
+
+            def store_refresh_page(page):
+                nonlocal refreshed_count
+                refreshed_count += store_messages(account_email, page)
+
+            client.list_messages_for_database_dump(
+                service,
+                max_results=args.refresh_max_results,
+                page_delay_seconds=args.page_delay,
+                page_callback=store_refresh_page,
+                category="all",
+                unread_only=False,
+                include_archived=True,
+                sender_email=sender_email,
+            )
+            print(
+                f"Refreshed {refreshed_count} message(s) from {sender_email}."
+            )
+
+            headlines = database.list_inbox_messages_by_sender(
+                account_email,
+                sender_email,
+            )
+            if not headlines:
+                print(f"No Inbox messages remain for {sender_email}.")
+                continue
+
+            print_email_filtered_results(
+                headlines,
+                sender_email,
+                unread_only=False,
+            )
+            archive_count = min(len(headlines), args.max_results)
+            print(
+                f"\nThe preview contains {len(headlines)} message(s). "
+                f"The newest {archive_count} will be moved to Trash because "
+                f"--max-results is {args.max_results}."
+            )
+            if not confirm_all_inbox_archive_prompt(
+                sender_email,
+                archive_count,
+                len(headlines),
+            ):
+                print(f"Archive cancelled for {sender_email}.")
+                continue
+
+            message_ids = [
+                headline["id"] for headline in headlines[:args.max_results]
+            ]
+
+            def record_top_sender_progress(
+                message_id,
+                trashed_message,
+                completed,
+                total,
+            ):
+                database.mark_message_trashed(
+                    account_email,
+                    message_id,
+                    label_ids=trashed_message.get("labelIds"),
+                )
+                current_time = datetime.now().astimezone().isoformat(
+                    timespec="seconds"
+                )
+                print(f"[{current_time}] trashed: {completed}/{total}")
+
+            archived_count = client.archive_messages(
+                service,
+                message_ids,
+                trash_delay_seconds=args.trash_delay,
+                progress_callback=record_top_sender_progress,
+            )
+            print(
+                f"Trashed {archived_count} Inbox message(s) from "
+                f"{sender_email}."
+            )
+
+            print(
+                f"\nChecking Gmail for messages from {sender_email} "
+                "that remain in the Inbox..."
+            )
+            remaining = client.list_messages_by_sender(
+                service,
+                sender_email,
+                max_results=args.max_results,
+                page_delay_seconds=args.page_delay,
+                metadata_provider=load_cached_metadata,
+                inbox_only=True,
+            )
+            store_messages(account_email, remaining)
+            if remaining:
+                print_email_filtered_results(
+                    remaining,
+                    sender_email,
+                    unread_only=False,
+                )
+            else:
+                print(f"No messages from {sender_email} remain in the Inbox.")
+        return
+
     archive_email_address = (
-        args.archive_email_address or args.archive_all_promotional_email_address
+        args.archive_email_address
+        or args.archive_all_promotional_email_address
+        or args.archive_all_inbox_email_address
     )
     if archive_email_address:
-        unread_only = args.archive_email_address is not None
-        headlines = database.list_promotions_by_sender(
-            account_email,
-            archive_email_address,
-            unread_only=unread_only,
-            max_results=args.max_results,
+        archive_all_inbox = args.archive_all_inbox_email_address is not None
+        archive_all_promotional = (
+            args.archive_all_promotional_email_address is not None
         )
+        unread_only = args.archive_email_address is not None
+        if archive_all_inbox:
+            headlines = database.list_inbox_messages_by_sender(
+                account_email,
+                archive_email_address,
+            )
+        else:
+            headlines = database.list_promotions_by_sender(
+                account_email,
+                archive_email_address,
+                unread_only=unread_only,
+                max_results=None if archive_all_promotional else args.max_results,
+            )
         print(f"Loaded {len(headlines)} matching message(s) from the database.")
         if not headlines:
             message_kind = "unread messages" if unread_only else "messages"
@@ -313,11 +567,30 @@ def main():
             unread_only=unread_only,
         )
 
-        if not confirm_archive_prompt(len(headlines)):
+        archive_count = min(len(headlines), args.max_results)
+        print(
+            f"\nThe preview contains {len(headlines)} message(s). "
+            f"The newest {archive_count} will be moved to Trash because "
+            f"--max-results is {args.max_results}."
+        )
+
+        if archive_all_inbox:
+            confirmed = confirm_all_inbox_archive_prompt(
+                archive_email_address,
+                archive_count,
+                len(headlines),
+            )
+        else:
+            confirmed = confirm_archive_prompt(archive_count)
+        if not confirmed:
             print("Archive cancelled.")
             return
 
-        message_ids = [headline.get("id") for headline in headlines if headline.get("id")]
+        message_ids = [
+            headline.get("id")
+            for headline in headlines[:args.max_results]
+            if headline.get("id")
+        ]
         def record_trash_progress(message_id, trashed_message, completed, total):
             database.mark_message_trashed(
                 account_email,
@@ -334,7 +607,10 @@ def main():
             progress_callback=record_trash_progress,
         )
 
-        message_kind = "unread message(s)" if unread_only else "message(s)"
+        if archive_all_inbox:
+            message_kind = "Inbox message(s)"
+        else:
+            message_kind = "unread message(s)" if unread_only else "message(s)"
         print(f"Trashed {archived_count} {message_kind} from {archive_email_address}.")
 
         if args.archive_all_promotional_email_address:
@@ -361,6 +637,31 @@ def main():
                 print(
                     f"No messages from {archive_email_address} remain outside "
                     "Spam and Trash."
+                )
+        elif archive_all_inbox:
+            print(
+                f"\nChecking Gmail for messages from {archive_email_address} "
+                "that remain in the Inbox..."
+            )
+            remaining = client.list_messages_by_sender(
+                service,
+                archive_email_address,
+                max_results=args.max_results,
+                page_delay_seconds=args.page_delay,
+                metadata_provider=load_cached_metadata,
+                inbox_only=True,
+            )
+            store_messages(account_email, remaining)
+            if remaining:
+                print_email_filtered_results(
+                    remaining,
+                    archive_email_address,
+                    unread_only=False,
+                )
+            else:
+                print(
+                    f"No messages from {archive_email_address} remain in "
+                    "the Inbox."
                 )
         return
 
